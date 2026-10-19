@@ -1725,7 +1725,7 @@ pub(super) unsafe fn collect_required_fields(
     // sentinel input never appears in the projection's `input_vars`.
     for window_agg in join_clause.window_aggs.iter() {
         match &window_agg.agg_def {
-            WindowAggDef::Sql(sql, _filter) => {
+            WindowAggDef::Sql(sql, _) => {
                 // TODO: Get fields from filter
                 if let Some(ci) = sql.col_info() {
                     ensure_column_in_all_sources(&mut plan_sources, ci.rti, ci.attno);
@@ -1734,7 +1734,7 @@ pub(super) unsafe fn collect_required_fields(
             // `pdb.agg()` names index fields, which can be aliases of a column
             // or JSON sub-fields, so they register by name, as in the
             // aggregate scan.
-            WindowAggDef::PdbAgg(request, _filter) => {
+            WindowAggDef::PdbAgg(request, _) => {
                 // TODO: Get fields from filter
                 for field in request.fields() {
                     let Some(source) = plan_sources
@@ -1752,6 +1752,11 @@ pub(super) unsafe fn collect_required_fields(
                         ),
                     }
                 }
+            }
+        }
+        if let Some(filter) = window_agg.agg_def.filter() {
+            for column_ref in filter.collect_column_refs() {
+                ensure_column_in_all_sources(&mut plan_sources, column_ref.rti, column_ref.attno);
             }
         }
     }
