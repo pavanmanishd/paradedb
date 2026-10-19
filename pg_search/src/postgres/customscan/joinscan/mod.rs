@@ -2463,12 +2463,6 @@ impl JoinScan {
         let (mut plan, multi_table_clauses) =
             datafusion_build::extract_join_tree_from_parse(root, &sources, path_info)
                 .map_err(|e| warn(JoinDeclineReason::new(format!("JoinScan not used: {e}"))))?;
-        let predicates = plan.search_predicates();
-        crate::postgres::customscan::joinscan::build::assign_tagged_queries(
-            plan.sources_mut(),
-            &predicates,
-        );
-
         // Need at least one search predicate in the plan (unless enable_custom_scan_without_operator is set).
         // Quietly decline before validating clauses or join shapes to avoid false-alarm planner warnings.
         // The planner can simplify the operator out of the quals, so the query as written counts too.
@@ -2504,6 +2498,17 @@ impl JoinScan {
 
         let (join_clause, limit_offset) =
             Self::validate_and_build_clause(root, &plan, &join_keys, has_distinct).map_err(warn)?;
+
+        let mut predicates = plan.search_predicates();
+        for p in join_clause.window_agg_filter_predicates() {
+            if !predicates.contains(&p) {
+                predicates.push(p);
+            }
+        }
+        crate::postgres::customscan::joinscan::build::assign_tagged_queries(
+            plan.sources_mut(),
+            &predicates,
+        );
 
         let path = Self::finalize_clause_into_path(
             root,
