@@ -1725,7 +1725,8 @@ pub(super) unsafe fn collect_required_fields(
     // sentinel input never appears in the projection's `input_vars`.
     for window_agg in join_clause.window_aggs.iter() {
         match &window_agg.agg_def {
-            WindowAggDef::Sql(sql) => {
+            WindowAggDef::Sql(sql, _filter) => {
+                // TODO: Get fields from filter
                 if let Some(ci) = sql.col_info() {
                     ensure_column_in_all_sources(&mut plan_sources, ci.rti, ci.attno);
                 }
@@ -1733,7 +1734,8 @@ pub(super) unsafe fn collect_required_fields(
             // `pdb.agg()` names index fields, which can be aliases of a column
             // or JSON sub-fields, so they register by name, as in the
             // aggregate scan.
-            WindowAggDef::PdbAgg(request) => {
+            WindowAggDef::PdbAgg(request, _filter) => {
+                // TODO: Get fields from filter
                 for field in request.fields() {
                     let Some(source) = plan_sources
                         .iter_mut()
@@ -2237,9 +2239,10 @@ pub fn resolve_fast_field_from_join_sources(
 /// the return type is Arrow-convertible.
 pub(crate) unsafe fn resolve_target_entry_expr(
     expr: *mut pg_sys::Node,
-    sources: &[&JoinSource],
     root: *mut pg_sys::PlannerInfo,
+    plan: &RelNode,
 ) -> Result<ResolvedExpr, JoinDeclineReason> {
+    let sources = plan.sources();
     let tables_str = sources
         .iter()
         .map(|s| source_table_name(s))
@@ -2250,7 +2253,7 @@ pub(crate) unsafe fn resolve_target_entry_expr(
     if let Some(var) = nodecast!(Var, T_Var, expr) {
         let var = unsafe { &*var };
         let varno = var.varno as pg_sys::Index;
-        let is_fast = resolve_fast_field_from_join_sources(sources, var).is_some() || {
+        let is_fast = resolve_fast_field_from_join_sources(&sources, var).is_some() || {
             crate::postgres::customscan::joinscan::build::try_extract_lateral_unnest(root, varno)
                 .is_some_and(|u| sources.iter().any(|s| s.contains_rti(u.source_rti.0)))
         };
@@ -2364,11 +2367,10 @@ pub(crate) unsafe fn resolve_target_entry_expr(
     // aggregate, bare OVER (), fast-field argument, no FILTER).
     let mut window_deps = Vec::new();
     if !deps.window_funcs.is_empty() {
-        let parse = &*(*root).parse;
         for (ordinal, wf) in deps.window_funcs.iter().enumerate() {
             // The owning target entry's resno is unknown here; 0 is a
             // placeholder the recording caller replaces (see `window_deps`).
-            match extract_window_agg(*wf, sources, parse, WindowAggId::nested(0, ordinal)) {
+            match extract_window_agg(*wf, root, plan, WindowAggId::nested(0, ordinal)) {
                 Ok(wa) => window_deps.push(wa),
                 Err(e) => {
                     return Err(JoinDeclineReason::new(format!(
@@ -2413,7 +2415,7 @@ pub(crate) unsafe fn resolve_target_entry_expr(
                 let ir = PgSearchRelation::open(source.scan_info.indexrelid);
                 let td = hr.tuple_desc();
                 if resolve_fast_field(varattno as i32, &td, &ir).is_none() {
-                    let col = column_name_for_var(sources, varno, varattno);
+                    let col = column_name_for_var(&plan.sources(), varno, varattno);
                     pgrx::debug1!(
                         "JoinScan declined: expression depends on '{}' \
                          which is not columnar (rti={}, attno={}, heaprelid={}) \
@@ -2487,7 +2489,7 @@ pub(crate) unsafe fn resolve_target_entry_expr(
 /// When there is no DISTINCT clause, returns `Some(vec![])`.
 pub(super) unsafe fn distinct_columns_are_fast_fields(
     root: *mut pg_sys::PlannerInfo,
-    sources: &[&JoinSource],
+    plan: &RelNode,
 ) -> Option<Vec<ResolvedExpr>> {
     let parse = (*root).parse;
     if (*parse).distinctClause.is_null() {
@@ -2506,7 +2508,7 @@ pub(super) unsafe fn distinct_columns_are_fast_fields(
             .find(|te| (**te).ressortgroupref == tle_ref)?;
 
         let expr = strip_wrappers((*te).expr as *mut pg_sys::Node);
-        let resolved = resolve_target_entry_expr(expr, sources, root).ok()?;
+        let resolved = resolve_target_entry_expr(expr, root, plan).ok()?;
         entries.push(resolved);
     }
 

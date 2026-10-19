@@ -656,7 +656,7 @@ impl JoinScan {
             ));
         }
 
-        if has_distinct && distinct_columns_are_fast_fields(root, &all_sources).is_none() {
+        if has_distinct && distinct_columns_are_fast_fields(root, plan).is_none() {
             return Err(JoinDeclineReason::new(
                 "JoinScan not used: DISTINCT columns must be columnar indexed",
             ));
@@ -714,8 +714,8 @@ impl JoinScan {
             } else if let Some(wf) = nodecast!(WindowFunc, T_WindowFunc, check_expr) {
                 let window_agg = match extract_window_agg(
                     wf,
-                    &all_sources,
-                    parse,
+                    root,
+                    plan,
                     window_func::WindowAggId::bare(te.resno as pg_sys::AttrNumber),
                 ) {
                     Ok(wa) => wa,
@@ -725,7 +725,7 @@ impl JoinScan {
                 };
                 window_aggs.push(window_agg);
             } else {
-                match planning::resolve_target_entry_expr(check_expr, &all_sources, root) {
+                match planning::resolve_target_entry_expr(check_expr, root, plan) {
                     Err(e) => {
                         return Err(e);
                     }
@@ -760,7 +760,7 @@ impl JoinScan {
         // puts out: the aggregate reads the join's rows.
         let root_id = PlannerRootId::from(root);
         for window_agg in &mut window_aggs {
-            if let WindowAggDef::PdbAgg(request) = &mut window_agg.agg_def {
+            if let WindowAggDef::PdbAgg(request, _) = &mut window_agg.agg_def {
                 request
                     .assign_plan_positions(|field| {
                         plan.plan_position(root_id, field.rti, field.attno)
@@ -2115,8 +2115,7 @@ unsafe fn build_output_projection(
     // calls walk the same parse tree. Consider caching the result in a
     // planning-phase-scoped structure to avoid redundant work.
     let distinct_entries = if private_data.join_clause.has_distinct {
-        let all_sources = private_data.join_clause.plan.sources();
-        distinct_columns_are_fast_fields(root, &all_sources)
+        distinct_columns_are_fast_fields(root, &private_data.join_clause.plan)
     } else {
         None
     };
@@ -2164,7 +2163,6 @@ unsafe fn build_output_projection(
 
     // For non-DISTINCT entries (or entries not matched above), resolve any expressions
     // so DataFusion can evaluate them and exec_custom_scan can project their results.
-    let all_sources = private_data.join_clause.plan.sources();
     for (scan_idx, te) in scan_target_entries.iter().copied().enumerate() {
         if resolved_entries[scan_idx].is_some() {
             continue;
@@ -2183,7 +2181,8 @@ unsafe fn build_output_projection(
         let scan_expr = crate::postgres::utils::strip_wrappers((*te).expr.cast());
         if (*scan_expr).type_ != pg_sys::NodeTag::T_Var
             && get_score_func_rti(scan_expr.cast()).is_none()
-            && let Ok(resolved) = planning::resolve_target_entry_expr(scan_expr, &all_sources, root)
+            && let Ok(resolved) =
+                planning::resolve_target_entry_expr(scan_expr, root, &private_data.join_clause.plan)
         {
             resolved_entries[scan_idx] = Some(resolved);
         }
@@ -2800,7 +2799,7 @@ impl JoinScan {
                     };
                     let agg_col = batch.column(col_idx);
                     let try_maybe_datum = match &window_agg.agg_def {
-                        WindowAggDef::Sql(sql) => {
+                        WindowAggDef::Sql(sql, _) => {
                             let numeric = match numeric_window_field(
                                 sql.agg_type(),
                                 sql.arg_field_type(),
@@ -2818,7 +2817,7 @@ impl JoinScan {
                                 row_idx,
                             )
                         }
-                        WindowAggDef::PdbAgg(_) => {
+                        WindowAggDef::PdbAgg(_, _) => {
                             debug_assert_single_document(agg_col.as_ref());
                             let mut window_agg_datums =
                                 state.custom_state().window_agg_datums.borrow_mut();
