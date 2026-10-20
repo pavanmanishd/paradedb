@@ -309,6 +309,15 @@ mod tests {
             prop_assert_eq!(us, pg);
         });
     }
+
+    #[pg_test]
+    fn convert_pg_date_string_test() {
+        use crate::postgres::utils::convert_pg_date_string;
+        use pgrx::PgBuiltInOids;
+
+        let dt = convert_pg_date_string(PgBuiltInOids::DATEOID.into(), "2024-01-01");
+        assert!(!dt.is_infinity());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -644,26 +653,7 @@ pub fn strip_unnest_and_relabel(mut node: *mut pg_sys::Node) -> (*mut pg_sys::No
 
 /// Identifies if the function identified by `funcid` is `pg_catalog.unnest(anyarray)`.
 pub fn is_unnest_func(funcid: pg_sys::Oid) -> bool {
-    use std::sync::Once;
-    static mut UNNEST_OID: pg_sys::Oid = pg_sys::InvalidOid;
-    static UNNEST_OID_ONCE: Once = Once::new();
-
-    unsafe {
-        UNNEST_OID_ONCE.call_once(|| {
-            if let Some(oid) = direct_function_call::<pg_sys::Oid>(
-                pg_sys::regprocedurein,
-                &[c"pg_catalog.unnest(anyarray)".into_datum()],
-            ) {
-                UNNEST_OID = oid;
-            }
-        });
-
-        if funcid == UNNEST_OID && UNNEST_OID != pg_sys::InvalidOid {
-            return true;
-        }
-
-        false
-    }
+    funcid.to_u32() == pg_sys::F_UNNEST_ANYARRAY
 }
 
 /// Create a text Const node from a string
@@ -1075,7 +1065,7 @@ pub fn convert_pg_date_string(typeoid: PgOid, date_string: &str) -> PostgresDate
         PgOid::BuiltIn(PgBuiltInOids::DATEOID | PgBuiltInOids::DATERANGEOID) => {
             let d = pgrx::datum::Date::from_str(date_string)
                 .expect("must be valid postgres date format");
-            PostgresDateTime::from(d)
+            PostgresDateTime::try_from(d).expect("date out of range")
         }
         // For TIMESTAMPOID, Used only by legacy indexes as of v0.24.0.
         PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPOID | PgBuiltInOids::TSRANGEOID) => {
