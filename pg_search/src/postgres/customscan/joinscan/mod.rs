@@ -2157,6 +2157,11 @@ unsafe fn build_output_projection(
         let distinct_list = PgList::<pg_sys::SortGroupClause>::from_pg((*parse).distinctClause);
 
         for (clause_ptr, entry) in distinct_list.iter_ptr().zip(entries.iter()) {
+            if matches!(entry, planning::ResolvedExpr::WindowConstant) {
+                // global window functions return the same value for every row, so they don't affect
+                // DISTINCT output. skip them
+                continue;
+            }
             let tle_ref = (*clause_ptr).tleSortGroupRef;
             if let Some(parse_te) = parse_tlist
                 .iter_ptr()
@@ -2300,7 +2305,9 @@ unsafe fn build_output_projection(
                             field_name: field_name.clone(),
                         }
                     }
-                    Some(planning::ResolvedExpr::PgProjected) | None => info.into(),
+                    Some(planning::ResolvedExpr::PgProjected)
+                    | Some(planning::ResolvedExpr::WindowConstant)
+                    | None => info.into(),
                 }
             })
             .collect(),

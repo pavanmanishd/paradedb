@@ -1988,6 +1988,29 @@ unsafe fn pathkey_is_outer_only(
     true
 }
 
+fn expr_is_window_constant(expr: *mut pg_sys::Node) -> bool {
+    if expr.is_null() {
+        return false;
+    }
+    if !expr.contains_window_func() {
+        return false;
+    }
+
+    unsafe {
+        // window functions come back whole, un-recursed, so any vars in this list sit outside
+        // of the window function
+        let nodes = PgList::<pg_sys::Node>::from_pg(pg_sys::pull_var_clause(
+            expr,
+            (pg_sys::PVC_INCLUDE_WINDOWFUNCS
+                | pg_sys::PVC_RECURSE_AGGREGATES
+                | pg_sys::PVC_RECURSE_PLACEHOLDERS) as i32,
+        ));
+        nodes
+            .iter_ptr()
+            .all(|n| (*n).type_ != pg_sys::NodeTag::T_Var)
+    }
+}
+
 /// Returns true if every member is an `OVER ()` window function, or an expression containing such a
 /// function and constants only, meaning it will not effect the sort order of the result
 fn pathkey_is_window_constant(equivclass: &pg_sys::EquivalenceClass) -> bool {
@@ -1995,23 +2018,7 @@ fn pathkey_is_window_constant(equivclass: &pg_sys::EquivalenceClass) -> bool {
     members.iter_ptr().any(|member| {
         let member = unsafe { &*member };
         let check_expr = strip_wrappers(member.em_expr.cast());
-        if !check_expr.contains_window_func() {
-            return false;
-        }
-
-        unsafe {
-            // window functions come back whole, un-recursed, so any vars in this list sit outside
-            // of the window function
-            let nodes = PgList::<pg_sys::Node>::from_pg(pg_sys::pull_var_clause(
-                check_expr,
-                (pg_sys::PVC_INCLUDE_WINDOWFUNCS
-                    | pg_sys::PVC_RECURSE_AGGREGATES
-                    | pg_sys::PVC_RECURSE_PLACEHOLDERS) as i32,
-            ));
-            nodes
-                .iter_ptr()
-                .all(|n| (*n).type_ != pg_sys::NodeTag::T_Var)
-        }
+        expr_is_window_constant(check_expr)
     })
 }
 
@@ -2232,6 +2239,8 @@ pub(crate) enum ResolvedExpr {
         window_deps: Vec<WindowAgg>,
     },
     PgProjected,
+    /// A window function, or expression over one, that will return a constant value on all rows
+    WindowConstant,
 }
 
 // ---------------------------------------------------------------------------
@@ -2650,7 +2659,13 @@ pub(super) unsafe fn distinct_columns_are_fast_fields(
             .find(|te| (**te).ressortgroupref == tle_ref)?;
 
         let expr = strip_wrappers((*te).expr as *mut pg_sys::Node);
-        let resolved = resolve_target_entry_expr(expr, root, plan, false).ok()?;
+        let resolved = if expr_is_window_constant(expr) {
+            // global window functions don't effect ordering, so we can just note their presence and move
+            // on
+            ResolvedExpr::WindowConstant
+        } else {
+            resolve_target_entry_expr(expr, root, plan, false).ok()?
+        };
         assert!(
             !matches!(resolved, ResolvedExpr::PgProjected),
             "distinct columns can never be postgres projected"
