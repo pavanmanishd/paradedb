@@ -511,7 +511,7 @@ pub unsafe fn try_create_subplan_join_paths(
     // Phase 1: validate + build JoinCSClause.
     let has_distinct = !(*(*root).parse).distinctClause.is_null();
     let (join_clause, limit_offset) =
-        match JoinScan::validate_and_build_clause(root, &plan, &join_keys, has_distinct) {
+        match JoinScan::validate_and_build_clause(root, plan.clone(), &join_keys, has_distinct) {
             Ok(res) => res,
             Err(reason) => {
                 let aliases: Vec<String> = plan
@@ -602,7 +602,7 @@ impl JoinScan {
     /// the returned clause before passing it to `finalize_clause_into_path`.
     unsafe fn validate_and_build_clause(
         root: *mut pg_sys::PlannerInfo,
-        plan: &RelNode,
+        plan: RelNode,
         join_keys: &[build::JoinKeyPair],
         has_distinct: bool,
     ) -> Result<(JoinCSClause, Option<LimitOffset>), JoinDeclineReason> {
@@ -656,7 +656,7 @@ impl JoinScan {
             ));
         }
 
-        if has_distinct && distinct_columns_are_fast_fields(root, plan).is_none() {
+        if has_distinct && distinct_columns_are_fast_fields(root, &plan).is_none() {
             return Err(JoinDeclineReason::new(
                 "JoinScan not used: DISTINCT columns must be columnar indexed",
             ));
@@ -715,7 +715,7 @@ impl JoinScan {
                 let window_agg = match extract_window_agg(
                     wf,
                     root,
-                    plan,
+                    &plan,
                     window_func::WindowAggId::bare(te.resno as pg_sys::AttrNumber),
                 ) {
                     Ok(wa) => wa,
@@ -725,7 +725,7 @@ impl JoinScan {
                 };
                 window_aggs.push(window_agg);
             } else {
-                match planning::resolve_target_entry_expr(check_expr, root, plan) {
+                match planning::resolve_target_entry_expr(check_expr, root, &plan) {
                     Err(e) => {
                         return Err(e);
                     }
@@ -819,7 +819,7 @@ impl JoinScan {
         }
 
         // --- Build JoinCSClause ---
-        let mut join_clause = JoinCSClause::new(plan.clone())
+        let mut join_clause = JoinCSClause::new(plan)
             .with_limit_offset(limit_offset.clone())
             .with_distinct(has_distinct)
             .with_window_aggs(window_aggs);
@@ -2496,17 +2496,17 @@ impl JoinScan {
         let has_distinct = !(*parse).distinctClause.is_null();
         let join_keys = plan.join_keys();
 
-        let (join_clause, limit_offset) =
-            Self::validate_and_build_clause(root, &plan, &join_keys, has_distinct).map_err(warn)?;
+        let (mut join_clause, limit_offset) =
+            Self::validate_and_build_clause(root, plan, &join_keys, has_distinct).map_err(warn)?;
 
-        let mut predicates = plan.search_predicates();
+        let mut predicates = join_clause.plan.search_predicates();
         for p in join_clause.window_agg_filter_predicates() {
             if !predicates.contains(&p) {
                 predicates.push(p);
             }
         }
         crate::postgres::customscan::joinscan::build::assign_tagged_queries(
-            plan.sources_mut(),
+            join_clause.plan.sources_mut(),
             &predicates,
         );
 
