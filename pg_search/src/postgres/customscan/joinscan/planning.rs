@@ -1894,10 +1894,10 @@ fn collect_source_rtis(sources: &[&JoinSource]) -> Vec<pg_sys::Index> {
 /// relation in `output_rtis`. Such pathkeys are "outer-only" w.r.t. this join
 /// subtree — the parent plan owns sorting on those keys.
 unsafe fn pathkey_is_outer_only(
-    equivclass: *mut pg_sys::EquivalenceClass,
+    equivclass: &pg_sys::EquivalenceClass,
     output_rtis: &[pg_sys::Index],
 ) -> bool {
-    let members = PgList::<pg_sys::EquivalenceMember>::from_pg((*equivclass).ec_members);
+    let members = PgList::<pg_sys::EquivalenceMember>::from_pg(equivclass.ec_members);
     for member in members.iter_ptr() {
         let check_expr = strip_wrappers((*member).em_expr.cast());
 
@@ -1918,14 +1918,43 @@ unsafe fn pathkey_is_outer_only(
     true
 }
 
+/// Returns true if every member is an `OVER ()` window function, or an expression containing such a
+/// function and constants only, meaning it will not effect the sort order of the result
+fn pathkey_is_window_constant(equivclass: &pg_sys::EquivalenceClass) -> bool {
+    let members = unsafe { PgList::<pg_sys::EquivalenceMember>::from_pg(equivclass.ec_members) };
+    members.iter_ptr().any(|member| {
+        let member = unsafe { &*member };
+        let check_expr = strip_wrappers(member.em_expr.cast());
+        if !check_expr.contains_window_func() {
+            return false;
+        }
+
+        unsafe {
+            // window functions come back whole, un-recursed, so any vars in this list sit outside
+            // of thew window function
+            let nodes = PgList::<pg_sys::Node>::from_pg(pg_sys::pull_var_clause(
+                check_expr,
+                (pg_sys::PVC_INCLUDE_WINDOWFUNCS
+                    | pg_sys::PVC_RECURSE_AGGREGATES
+                    | pg_sys::PVC_RECURSE_PLACEHOLDERS) as i32,
+            ));
+            nodes
+                .iter_ptr()
+                .any(|n| (*n).type_ != pg_sys::NodeTag::T_Var)
+        }
+    })
+}
+
 /// Check if all ORDER BY columns are fast fields.
 ///
 /// For JoinScan to be proposed, all columns used in ORDER BY must be fast fields
 /// in their respective ParadeDB indexes (or be paradedb.score() which is handled separately).
 /// Validate whether all ORDER BY clauses can be handled by JoinScan.
 ///
-/// Pathkeys that reference only relations outside this join subtree ("outer-only")
+/// Pathkeys that reference only relations outside this join subtree ("outer-only"),
 /// are skipped — the parent plan is responsible for sorting on those keys.
+///
+/// Pathkeys that don't affect sorting (mainly the output of global window functions) are skipped
 ///
 /// Returns `Ok(())` if:
 /// - No ORDER BY clause exists
@@ -1947,15 +1976,16 @@ pub(super) unsafe fn order_by_columns_are_fast_fields(
     let source_rtis = collect_source_rtis(sources);
 
     'pathkey: for pathkey_ptr in pathkeys.iter_ptr() {
-        let equivclass = (*pathkey_ptr).pk_eclass;
+        let equivclass = &*(*pathkey_ptr).pk_eclass;
 
-        if pathkey_is_outer_only(equivclass, &source_rtis) {
+        if pathkey_is_outer_only(equivclass, &source_rtis) || pathkey_is_window_constant(equivclass)
+        {
             continue;
         }
 
-        let members = PgList::<pg_sys::EquivalenceMember>::from_pg((*equivclass).ec_members);
+        let members = PgList::<pg_sys::EquivalenceMember>::from_pg(equivclass.ec_members);
         // If a collation isn't "safe" (C-like), then we can't pushdown as Tantivy uses byte ordering
-        let collation = (*equivclass).ec_collation;
+        let collation = equivclass.ec_collation;
         if !collation_supports(collation, CollationOperation::Ordering) {
             return Err(JoinDeclineReason::new(
                 "JoinScan not used: ORDER BY columns must have a byte-ordered (C-like) collation",
@@ -2899,12 +2929,13 @@ pub(super) unsafe fn extract_orderby(
 
     for pathkey_ptr in pathkeys.iter_ptr() {
         let pathkey = pathkey_ptr;
-        let equivclass = (*pathkey).pk_eclass;
+        let equivclass = &*(*pathkey).pk_eclass;
 
-        if pathkey_is_outer_only(equivclass, output_rtis) {
+        if pathkey_is_outer_only(equivclass, output_rtis) || pathkey_is_window_constant(equivclass)
+        {
             continue;
         }
-        let members = PgList::<pg_sys::EquivalenceMember>::from_pg((*equivclass).ec_members);
+        let members = PgList::<pg_sys::EquivalenceMember>::from_pg(equivclass.ec_members);
 
         let nulls_first = (*pathkey).pk_nulls_first;
         #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
