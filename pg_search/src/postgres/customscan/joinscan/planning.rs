@@ -1987,7 +1987,11 @@ unsafe fn pathkey_is_outer_only(
     }
     true
 }
-
+/// Returns true if the expression is an `OVER ()` window function, or an expression containing such a
+/// function and constants only, meaning it will not effect the sort order of the result.
+///
+/// NOTE: We don't check the OVER () clause because any window func with a non-bare OVER () is
+/// rejected at an earlier point
 fn expr_is_window_constant(expr: *mut pg_sys::Node) -> bool {
     if expr.is_null() {
         return false;
@@ -2015,7 +2019,7 @@ fn expr_is_window_constant(expr: *mut pg_sys::Node) -> bool {
 /// function and constants only, meaning it will not effect the sort order of the result
 fn pathkey_is_window_constant(equivclass: &pg_sys::EquivalenceClass) -> bool {
     let members = unsafe { PgList::<pg_sys::EquivalenceMember>::from_pg(equivclass.ec_members) };
-    members.iter_ptr().any(|member| {
+    members.iter_ptr().all(|member| {
         let member = unsafe { &*member };
         let check_expr = strip_wrappers(member.em_expr.cast());
         expr_is_window_constant(check_expr)
