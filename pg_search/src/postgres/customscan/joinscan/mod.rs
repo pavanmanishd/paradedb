@@ -762,7 +762,7 @@ impl JoinScan {
         // puts out: the aggregate reads the join's rows.
         let root_id = PlannerRootId::from(root);
         for window_agg in &mut window_aggs {
-            if let WindowAggDef::PdbAgg(request, _) = &mut window_agg.agg_def {
+            if let WindowAggDef::PdbAgg(request) = &mut window_agg.agg_def {
                 request
                     .assign_plan_positions(|field| {
                         plan.plan_position(root_id, field.rti, field.attno)
@@ -841,6 +841,17 @@ impl JoinScan {
         if join_clause.limit_offset.is_some() {
             is_limit_pushdown_safe(root, &join_clause)?;
         }
+
+        let mut predicates = join_clause.plan.search_predicates();
+        for p in join_clause.window_agg_filter_predicates() {
+            if !predicates.contains(&p) {
+                predicates.push(p);
+            }
+        }
+        crate::postgres::customscan::joinscan::build::assign_tagged_queries(
+            join_clause.plan.sources_mut(),
+            &predicates,
+        );
 
         Ok((join_clause, limit_offset))
     }
@@ -2541,19 +2552,8 @@ impl JoinScan {
         let has_distinct = !(*parse).distinctClause.is_null();
         let join_keys = plan.join_keys();
 
-        let (mut join_clause, limit_offset) =
+        let (join_clause, limit_offset) =
             Self::validate_and_build_clause(root, plan, &join_keys, has_distinct).map_err(warn)?;
-
-        let mut predicates = join_clause.plan.search_predicates();
-        for p in join_clause.window_agg_filter_predicates() {
-            if !predicates.contains(&p) {
-                predicates.push(p);
-            }
-        }
-        crate::postgres::customscan::joinscan::build::assign_tagged_queries(
-            join_clause.plan.sources_mut(),
-            &predicates,
-        );
 
         let path = Self::finalize_clause_into_path(
             root,
@@ -2859,7 +2859,7 @@ impl JoinScan {
                     };
                     let agg_col = batch.column(col_idx);
                     let try_maybe_datum = match &window_agg.agg_def {
-                        WindowAggDef::Sql(sql, _) => {
+                        WindowAggDef::Sql(sql) => {
                             let numeric = match numeric_window_field(
                                 sql.agg_type(),
                                 sql.arg_field_type(),
@@ -2877,7 +2877,7 @@ impl JoinScan {
                                 row_idx,
                             )
                         }
-                        WindowAggDef::PdbAgg(_, _) => {
+                        WindowAggDef::PdbAgg(_) => {
                             debug_assert_single_document(agg_col.as_ref());
                             let mut window_agg_datums =
                                 state.custom_state().window_agg_datums.borrow_mut();
